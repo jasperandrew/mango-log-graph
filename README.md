@@ -28,19 +28,6 @@ Or pass one or more log files explicitly (each opens in its own window):
 python mangograph.py MyGame_2026-05-29_12-00-00.csv
 ```
 
-### Panels
-
-Shown top to bottom by default:
-
-| Panel       | Content                                   |
-|-------------|-------------------------------------------|
-| `load`      | CPU and GPU utilization (%)               |
-| `temp`      | CPU and GPU temperature (°C)              |
-| `power`     | CPU and GPU power draw (W)                 |
-| `memory`    | RAM, VRAM, and swap usage (GB)            |
-| `frametime` | Per-frame time (ms) with rolling average  |
-| `fps`       | Raw FPS with rolling average, 1% low, avg |
-
 ### Interactions
 
 | Action        | Effect                                                |
@@ -67,6 +54,19 @@ Shown top to bottom by default:
 | `--trim-start SEC` | Drop the first SEC seconds of the session                |
 | `--trim-end SEC`   | Drop the last SEC seconds of the session                 |
 | `-o FILE`       | Save a screenshot to FILE instead of opening a window       |
+
+### Panel Names
+
+Shown top to bottom by default:
+
+| Panel       | Content                                   |
+|-------------|-------------------------------------------|
+| `load`      | CPU and GPU utilization (%)               |
+| `temp`      | CPU and GPU temperature (°C)              |
+| `power`     | CPU and GPU power draw (W)                 |
+| `memory`    | RAM, VRAM, and swap usage (GB)            |
+| `frametime` | Per-frame time (ms) with rolling average  |
+| `fps`       | Raw FPS with rolling average, 1% low, avg |
 
 Example — only the fps and frametime panels, smoothed over 60 frames:
 
