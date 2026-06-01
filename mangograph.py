@@ -496,38 +496,52 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
 
     _last_idx = [-1]
 
+    def place_overlays(idx, set_text=True):
+        xi = float(t[idx])
+        # All panels share the x-link, so take the x-range from first_p (the panel
+        # whose signal drives repositioning); reading each panel's own viewRange
+        # can lag a frame behind during pan as the link propagates.
+        vx0, vx1 = first_p.vb.viewRange()[0]
+        fracx = (xi - vx0) / (vx1 - vx0) if vx1 > vx0 else 0.0
+        for ps2 in panel_states:
+            vb2 = ps2["vb"]
+            ps2["vl"].setData([xi, xi], vb2.viewRange()[1])
+            # Pixel-space readout pinned to the panel bottom (clear of the
+            # top-left stats and top-right legend), centered on the cursor
+            # but clamped flush to whichever edge it would otherwise cross.
+            hv = ps2["hv"]
+            if set_text:
+                hv.setText(ps2["hover_fn"](idx))
+            bw    = hv.boundingRect().width()
+            cx    = vb2.pos().x() + fracx * vb2.size().width()
+            left, right = vb2.pos().x(), vb2.pos().x() + vb2.size().width()
+            bx = max(left + 2, min(cx - bw / 2, right - bw - 2))
+            by = vb2.pos().y() + vb2.size().height() - 3
+            hv.setPos(round(bx), round(by))
+            hv.setVisible(True)
+
     def on_mouse_move(scene_pos):
         for ps in panel_states:
             if ps["plot"].sceneBoundingRect().contains(scene_pos):
-                x   = ps["plot"].vb.mapSceneToView(scene_pos).x()
-                idx = nearest(x)
-                if idx == _last_idx[0]:
-                    return
-                _last_idx[0] = idx
-                xi  = float(t[idx])
-                for ps2 in panel_states:
-                    vb2 = ps2["vb"]
-                    (vx0, vx1), vy = vb2.viewRange()
-                    ps2["vl"].setData([xi, xi], vy)
-                    # Pixel-space readout pinned to the panel bottom (clear of the
-                    # top-left stats and top-right legend), centered on the cursor
-                    # but clamped flush to whichever edge it would otherwise cross.
-                    hv = ps2["hv"]
-                    hv.setText(ps2["hover_fn"](idx))
-                    bw    = hv.boundingRect().width()
-                    fracx = (xi - vx0) / (vx1 - vx0) if vx1 > vx0 else 0.0
-                    cx    = vb2.pos().x() + fracx * vb2.size().width()
-                    left, right = vb2.pos().x(), vb2.pos().x() + vb2.size().width()
-                    bx = max(left + 2, min(cx - bw / 2, right - bw - 2))
-                    by = vb2.pos().y() + vb2.size().height() - 3
-                    hv.setPos(round(bx), round(by))
-                    hv.setVisible(True)
+                idx = nearest(ps["plot"].vb.mapSceneToView(scene_pos).x())
+                if idx != _last_idx[0]:
+                    _last_idx[0] = idx
+                    place_overlays(idx)
                 return
         if _last_idx[0] != -1:
             _last_idx[0] = -1
             for ps in panel_states:
                 ps["vl"].setData([], [])
                 ps["hv"].setVisible(False)
+
+    # Keep the pixel-space readouts glued to the crosshair as the view moves: a
+    # pan/zoom leaves idx unchanged (so on_mouse_move debounces out) but shifts
+    # where that data point lands on screen. Text is unchanged, so skip setText.
+    def reposition_overlays():
+        if _last_idx[0] != -1:
+            place_overlays(_last_idx[0], set_text=False)
+
+    first_p.sigXRangeChanged.connect(lambda *_: reposition_overlays())
 
     _keep.append(pg.SignalProxy(
         first_p.scene().sigMouseMoved, rateLimit=30,
