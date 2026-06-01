@@ -73,6 +73,12 @@ def load_log(path):
 LOD_MAX_VISIBLE = 16_000
 LOD_RATIO       = 4
 
+# Headroom multipliers for the fps/frametime/power/memory y-axes: the default
+# view leaves more room above a smoothed/typical max, the full view (Y toggle)
+# hugs the absolute max.
+Y_PAD_FIT  = 1.2
+Y_PAD_FULL = 1.05
+
 
 def build_pyramid(x, y, cap=LOD_MAX_VISIBLE, ratio=LOD_RATIO):
     """Build min/max LOD levels for a series, finest (full) first. Each coarser
@@ -211,17 +217,15 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
     ft_roll       = rolling_avg(ft_ms, smooth)
     has_cpu_power = bool(cpu_power.any())
 
+    # Scalars still needed for the reference lines; per-panel stat strings are
+    # derived from each panel's slice_fn over a full-row mask (see below).
     fps_mean = float(np.mean(fps))
     fps_p1   = float(np.percentile(fps, 1))
-    fps_p01  = float(np.percentile(fps, 0.1))
     ft_mean  = float(np.mean(ft_ms))
     ft_p99   = float(np.percentile(ft_ms, 99))
-    sm_count = int((ft_ms > stutter_threshold * ft_roll).sum())
-    dur_min  = float(t[-1]) / 60
-    sm_rate  = sm_count / dur_min if dur_min > 0 else 0.0
-    pacing   = float(np.percentile(np.abs(np.diff(ft_ms)), 99))
 
     t0, t_end = float(t[0]), float(t[-1])
+    full_mask = np.ones(len(t), dtype=bool)
 
     if show is None:
         show = set(ALL_PANELS)
@@ -320,12 +324,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             p.addLine(y=fps_mean, pen=pg.mkPen(C["pct_line"], width=1, style=dash))
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["low_line"], width=1, style=dash)), "1% low")
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["pct_line"], width=1, style=dash)), "avg")
-            y_default = (0, float(fps_avg.max()) * 1.2)
-            y_full    = (0, float(fps.max()) * 1.05)
-            default_stats = "  ".join([
-                f"avg {fps_mean:.0f}", f"1% low {fps_p1:.0f}",
-                f"0.1% low {fps_p01:.0f}", f"max {fps.max():.0f}",
-            ])
+            y_default = (0, float(fps_avg.max()) * Y_PAD_FIT)
+            y_full    = (0, float(fps.max()) * Y_PAD_FULL)
             def slice_fn(mask):
                 s = fps[mask]
                 return "  ".join([
@@ -342,13 +342,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             p.addLine(y=ft_p99,  pen=pg.mkPen(C["low_line"], width=1, style=dash))
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["pct_line"], width=1, style=dash)), "avg")
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["low_line"], width=1, style=dash)), "99th pct")
-            y_default = (0, float(ft_roll.max()) * 1.2)
-            y_full    = (0, float(ft_ms.max()) * 1.05)
-            default_stats = "  ".join([
-                f"avg {ft_mean:.1f} ms", f"99th {ft_p99:.1f} ms",
-                f"stutters {sm_count} ({sm_rate:.1f}/min)",
-                f"pacing p99 {pacing:.1f} ms",
-            ])
+            y_default = (0, float(ft_roll.max()) * Y_PAD_FIT)
+            y_full    = (0, float(ft_ms.max()) * Y_PAD_FULL)
             def slice_fn(mask):
                 ft_s = ft_ms[mask]
                 t_s  = t[mask]
@@ -370,10 +365,6 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             _lp(p, t, cpu_load, pg.mkPen(C["cpu"], width=1), "CPU")
             _lp(p, t, gpu_load, pg.mkPen(C["gpu"], width=1), "GPU")
             y_default = y_full = (0, 105)
-            default_stats = "  ".join([
-                f"CPU  avg {np.mean(cpu_load):.0f}%  max {cpu_load.max():.0f}%",
-                f"GPU  avg {np.mean(gpu_load):.0f}%  max {gpu_load.max():.0f}%",
-            ])
             def slice_fn(mask):
                 cl, gl = cpu_load[mask], gpu_load[mask]
                 return "  ".join([
@@ -389,10 +380,6 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             tmin = min(float(cpu_temp.min()), float(gpu_temp.min())) * 0.9
             tmax = max(float(cpu_temp.max()), float(gpu_temp.max())) * 1.1
             y_default = y_full = (tmin, tmax)
-            default_stats = "  ".join([
-                f"CPU  avg {np.mean(cpu_temp):.0f}°  max {cpu_temp.max():.0f}°",
-                f"GPU  avg {np.mean(gpu_temp):.0f}°  max {gpu_temp.max():.0f}°",
-            ])
             def slice_fn(mask):
                 ct, gt = cpu_temp[mask], gpu_temp[mask]
                 return "  ".join([
@@ -408,13 +395,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             _lp(p, t, gpu_power, pg.mkPen(C["gpu"], width=1), "GPU")
             pmax = max(float(gpu_power.max()),
                        float(cpu_power.max()) if has_cpu_power else 0.0)
-            y_default = (0, pmax * 1.2)
-            y_full    = (0, pmax * 1.05)
-            pw_parts  = []
-            if has_cpu_power:
-                pw_parts.append(f"CPU  avg {np.mean(cpu_power):.0f}W  max {cpu_power.max():.0f}W")
-            pw_parts.append(f"GPU  avg {np.mean(gpu_power):.0f}W  max {gpu_power.max():.0f}W")
-            default_stats = "  ".join(pw_parts)
+            y_default = (0, pmax * Y_PAD_FIT)
+            y_full    = (0, pmax * Y_PAD_FULL)
             def slice_fn(mask):
                 parts = []
                 if has_cpu_power:
@@ -432,13 +414,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             _lp(p, t, gpu_vram,  pg.mkPen(C["vram"], width=1), "VRAM")
             _lp(p, t, swap_used, pg.mkPen(C["swap"], width=1), "Swap")
             mem_max = max(float(ram_used.max()), float(gpu_vram.max()), float(swap_used.max()))
-            y_default = (0, mem_max * 1.2)
-            y_full    = (0, mem_max * 1.05)
-            default_stats = "  ".join([
-                f"RAM  avg {np.mean(ram_used):.1f}  max {ram_used.max():.1f} GB",
-                f"VRAM  avg {np.mean(gpu_vram):.1f}  max {gpu_vram.max():.1f} GB",
-                f"Swap  max {swap_used.max():.1f} GB",
-            ])
+            y_default = (0, mem_max * Y_PAD_FIT)
+            y_full    = (0, mem_max * Y_PAD_FULL)
             def slice_fn(mask):
                 r, v, s = ram_used[mask], gpu_vram[mask], swap_used[mask]
                 return "  ".join([
@@ -451,6 +428,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             )
 
         # ── common items attached to this panel ──
+        # The default (whole-session) stats are just slice_fn over every row.
+        default_stats = slice_fn(full_mask)
         vl  = pg.PlotCurveItem([], [], pen=cross_pen)
         p.addItem(vl, ignoreBounds=True)
         st  = make_text_item(p, overlay=True)
@@ -461,7 +440,7 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
         panel_states.append({
             "name": name,
             "plot": p, "vb": vb,
-            "vl": vl, "st": st, "hv": hv, "reg": reg,
+            "vl": vl, "st": st, "hv": hv, "reg": reg, "bw": 0.0,
             "default_stats": default_stats,
             "slice_fn": slice_fn, "hover_fn": hover_fn,
             "y_default": y_default, "y_full": y_full,
@@ -494,7 +473,7 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             idx -= 1
         return idx
 
-    _last_idx = [-1]
+    _last_idx = -1
 
     def place_overlays(idx, set_text=True):
         xi = float(t[idx])
@@ -512,7 +491,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             hv = ps2["hv"]
             if set_text:
                 hv.setText(ps2["hover_fn"](idx))
-            bw    = hv.boundingRect().width()
+                ps2["bw"] = hv.boundingRect().width()  # width only changes with the text
+            bw    = ps2["bw"]
             cx    = vb2.pos().x() + fracx * vb2.size().width()
             left, right = vb2.pos().x(), vb2.pos().x() + vb2.size().width()
             bx = max(left + 2, min(cx - bw / 2, right - bw - 2))
@@ -521,15 +501,16 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             hv.setVisible(True)
 
     def on_mouse_move(scene_pos):
+        nonlocal _last_idx
         for ps in panel_states:
             if ps["plot"].sceneBoundingRect().contains(scene_pos):
                 idx = nearest(ps["plot"].vb.mapSceneToView(scene_pos).x())
-                if idx != _last_idx[0]:
-                    _last_idx[0] = idx
+                if idx != _last_idx:
+                    _last_idx = idx
                     place_overlays(idx)
                 return
-        if _last_idx[0] != -1:
-            _last_idx[0] = -1
+        if _last_idx != -1:
+            _last_idx = -1
             for ps in panel_states:
                 ps["vl"].setData([], [])
                 ps["hv"].setVisible(False)
@@ -538,8 +519,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
     # pan/zoom leaves idx unchanged (so on_mouse_move debounces out) but shifts
     # where that data point lands on screen. Text is unchanged, so skip setText.
     def reposition_overlays():
-        if _last_idx[0] != -1:
-            place_overlays(_last_idx[0], set_text=False)
+        if _last_idx != -1:
+            place_overlays(_last_idx, set_text=False)
 
     first_p.sigXRangeChanged.connect(lambda *_: reposition_overlays())
 
@@ -589,7 +570,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
 
     def update_lod():
         (x0, x1), _ = first_p.vb.viewRange()
-        visible = int(np.searchsorted(t, x1) - np.searchsorted(t, x0))
+        lo, hi  = np.searchsorted(t, (x0, x1))
+        visible = int(hi - lo)
         frac    = visible / n_full
         levels  = lod_curves[0]["levels"]
         idx     = len(levels) - 1
