@@ -174,7 +174,13 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
     col = {name: i for i, name in enumerate(headers)}
 
     if max_fps is not None:
-        data = data[data[:, col["fps"]] < max_fps]
+        total   = len(data)
+        keep    = data[:, col["fps"]] < max_fps
+        dropped = total - int(keep.sum())
+        if dropped:
+            print(f"Dropped {dropped} of {total} rows "
+                  f"({dropped / total * 100:.2f}%) at >= {max_fps:g} FPS")
+        data = data[keep]
 
     t         = (data[:, col["elapsed"]] - data[0, col["elapsed"]]) / 1e9
     fps       = data[:, col["fps"]]
@@ -302,7 +308,7 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
             p.addLine(y=fps_mean, pen=pg.mkPen(C["pct_line"], width=1, style=dash))
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["low_line"], width=1, style=dash)), "1% low")
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["pct_line"], width=1, style=dash)), "avg")
-            y_default = (fps_p1 * 0.9, float(np.percentile(fps_avg, 99.9)) * 1.2)
+            y_default = (fps_p1 * 0.9, float(np.percentile(fps_avg, 99.99)) * 1.2)
             y_full    = (float(fps.min()), float(fps.max()) * 1.05)
             default_stats = "  ".join([
                 f"avg {fps_mean:.0f}", f"1% low {fps_p1:.0f}",
@@ -437,7 +443,7 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
         p.addItem(vl, ignoreBounds=True)
         st  = make_text_item(p, overlay=True)
         st.setText(default_stats)
-        hv  = make_text_item(p, anchor=(0.5, 0), visible=False)
+        hv  = make_text_item(p, anchor=(0, 1), visible=False, overlay=True)
         reg = make_region(p)
 
         panel_states.append({
@@ -449,9 +455,10 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
             "y_default": y_default, "y_full": y_full,
         })
 
-    # ── duration label anchored to bottom-left of last panel ──
+    # ── span-duration label centered along the top of the last panel, clear of the
+    # bottom hover readouts (and of the top-left stats / top-right legend). ──
     last_p   = panel_states[-1]["plot"]
-    dur_item = make_text_item(last_p, anchor=(0, 1), visible=False, overlay=True)
+    dur_item = make_text_item(last_p, anchor=(0.5, 0), visible=False, overlay=True)
 
     # ── stats pinning ──
     # Overlay labels live in PlotItem pixel space so they don't move during
@@ -463,7 +470,7 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
 
     def pin_dur():
         vb = last_p.vb
-        dur_item.setPos(vb.pos().x() + 4, vb.pos().y() + vb.size().height() - 4)
+        dur_item.setPos(round(vb.pos().x() + vb.size().width() / 2), vb.pos().y() + 4)
 
     first_p.geometryChanged.connect(lambda: (pin_stats(), pin_dur()))
     _keep = []
@@ -487,12 +494,22 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
                 _last_idx[0] = idx
                 xi  = float(t[idx])
                 for ps2 in panel_states:
-                    vr  = ps2["plot"].viewRange()
-                    ps2["vl"].setData([xi, xi], vr[1])
-                    top = vr[1][0] + (vr[1][1] - vr[1][0]) * 0.96
-                    ps2["hv"].setText(ps2["hover_fn"](idx))
-                    ps2["hv"].setPos(xi, top)
-                    ps2["hv"].setVisible(True)
+                    vb2 = ps2["vb"]
+                    (vx0, vx1), vy = vb2.viewRange()
+                    ps2["vl"].setData([xi, xi], vy)
+                    # Pixel-space readout pinned to the panel bottom (clear of the
+                    # top-left stats and top-right legend), centered on the cursor
+                    # but clamped flush to whichever edge it would otherwise cross.
+                    hv = ps2["hv"]
+                    hv.setText(ps2["hover_fn"](idx))
+                    bw    = hv.boundingRect().width()
+                    fracx = (xi - vx0) / (vx1 - vx0) if vx1 > vx0 else 0.0
+                    cx    = vb2.pos().x() + fracx * vb2.size().width()
+                    left, right = vb2.pos().x(), vb2.pos().x() + vb2.size().width()
+                    bx = max(left + 2, min(cx - bw / 2, right - bw - 2))
+                    by = vb2.pos().y() + vb2.size().height() - 3
+                    hv.setPos(round(bx), round(by))
+                    hv.setVisible(True)
                 return
         if _last_idx[0] != -1:
             _last_idx[0] = -1
