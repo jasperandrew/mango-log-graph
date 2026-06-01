@@ -1,2 +1,2 @@
-# mango-log-graph
+# mangograph
 A tool for visualizing MangoHud logging data
