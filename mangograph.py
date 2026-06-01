@@ -56,6 +56,12 @@ def rolling_avg(x, window):
     return np.convolve(x, np.ones(window) / window, mode="same")
 
 
+def _num(s):
+    """Wrap a stat value in bold white so it stands out from its muted label
+    in the (HTML) stat boxes."""
+    return f'<b style="color:#fff">{s}</b>'
+
+
 def load_log(path):
     with open(path) as f:
         meta    = dict(zip(f.readline().strip().split(","), f.readline().strip().split(",")))
@@ -322,15 +328,17 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             _lp(p, t, fps_avg, pg.mkPen(C["fps_avg"], width=1.5), f"{smooth}-frame avg")
             p.addLine(y=fps_p1,   pen=pg.mkPen(C["low_line"], width=1, style=dash))
             p.addLine(y=fps_mean, pen=pg.mkPen(C["pct_line"], width=1, style=dash))
-            lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["low_line"], width=1, style=dash)), "1% low")
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["pct_line"], width=1, style=dash)), "avg")
+            lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["low_line"], width=1, style=dash)), "1% low")
             y_default = (0, float(fps_avg.max()) * Y_PAD_FIT)
             y_full    = (0, float(fps.max()) * Y_PAD_FULL)
             def slice_fn(mask):
                 s = fps[mask]
                 return "  ".join([
-                    f"avg {np.mean(s):.0f}", f"1% low {np.percentile(s,1):.0f}",
-                    f"0.1% low {np.percentile(s,0.1):.0f}", f"max {s.max():.0f}",
+                    f"avg {_num(f'{np.mean(s):.0f}')}",
+                    f"1% low {_num(f'{np.percentile(s,1):.0f}')}",
+                    f"0.1% low {_num(f'{np.percentile(s,0.1):.0f}')}",
+                    f"max {_num(f'{s.max():.0f}')}",
                 ])
             hover_fn = lambda i: f"t {fmt_duration(float(t[i]))}    FPS {fps[i]:.0f}"
 
@@ -353,10 +361,10 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
                 sr   = sc / dm if dm > 0 else 0.0
                 pp99 = float(np.percentile(np.abs(np.diff(ft_s)), 99)) if len(ft_s) > 1 else 0.0
                 return "  ".join([
-                    f"avg {np.mean(ft_s):.1f} ms",
-                    f"99th {np.percentile(ft_s, 99):.1f} ms",
-                    f"stutters {sc} ({sr:.1f}/min)",
-                    f"pacing p99 {pp99:.1f} ms",
+                    f"avg {_num(f'{np.mean(ft_s):.1f} ms')}",
+                    f"99th {_num(f'{np.percentile(ft_s, 99):.1f} ms')}",
+                    f"stutters {_num(sc)} ({_num(f'{sr:.1f}/min')})",
+                    f"pacing p99 {_num(f'{pp99:.1f} ms')}",
                 ])
             hover_fn = lambda i: f"{ft_ms[i]:.2f} ms  (avg {ft_roll[i]:.2f})"
 
@@ -368,8 +376,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             def slice_fn(mask):
                 cl, gl = cpu_load[mask], gpu_load[mask]
                 return "  ".join([
-                    f"CPU  avg {np.mean(cl):.0f}%  max {cl.max():.0f}%",
-                    f"GPU  avg {np.mean(gl):.0f}%  max {gl.max():.0f}%",
+                    f"CPU  avg {_num(f'{np.mean(cl):.0f}%')}  max {_num(f'{cl.max():.0f}%')}",
+                    f"GPU  avg {_num(f'{np.mean(gl):.0f}%')}  max {_num(f'{gl.max():.0f}%')}",
                 ])
             hover_fn = lambda i: f"CPU {cpu_load[i]:.0f}%    GPU {gpu_load[i]:.0f}%"
 
@@ -383,8 +391,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             def slice_fn(mask):
                 ct, gt = cpu_temp[mask], gpu_temp[mask]
                 return "  ".join([
-                    f"CPU  avg {np.mean(ct):.0f}°  max {ct.max():.0f}°",
-                    f"GPU  avg {np.mean(gt):.0f}°  max {gt.max():.0f}°",
+                    f"CPU  avg {_num(f'{np.mean(ct):.0f}°')}  max {_num(f'{ct.max():.0f}°')}",
+                    f"GPU  avg {_num(f'{np.mean(gt):.0f}°')}  max {_num(f'{gt.max():.0f}°')}",
                 ])
             hover_fn = lambda i: f"CPU {cpu_temp[i]:.0f}°    GPU {gpu_temp[i]:.0f}°"
 
@@ -400,8 +408,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             def slice_fn(mask):
                 parts = []
                 if has_cpu_power:
-                    parts.append(f"CPU  avg {np.mean(cpu_power[mask]):.0f}W  max {cpu_power[mask].max():.0f}W")
-                parts.append(f"GPU  avg {np.mean(gpu_power[mask]):.0f}W  max {gpu_power[mask].max():.0f}W")
+                    parts.append(f"CPU  avg {_num(f'{np.mean(cpu_power[mask]):.0f}W')}  max {_num(f'{cpu_power[mask].max():.0f}W')}")
+                parts.append(f"GPU  avg {_num(f'{np.mean(gpu_power[mask]):.0f}W')}  max {_num(f'{gpu_power[mask].max():.0f}W')}")
                 return "  ".join(parts)
             if has_cpu_power:
                 hover_fn = lambda i: f"CPU {cpu_power[i]:.0f}W    GPU {gpu_power[i]:.0f}W"
@@ -419,9 +427,9 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             def slice_fn(mask):
                 r, v, s = ram_used[mask], gpu_vram[mask], swap_used[mask]
                 return "  ".join([
-                    f"RAM  avg {np.mean(r):.1f}  max {r.max():.1f} GB",
-                    f"VRAM  avg {np.mean(v):.1f}  max {v.max():.1f} GB",
-                    f"Swap  max {s.max():.1f} GB",
+                    f"RAM  avg {_num(f'{np.mean(r):.1f} GB')}  max {_num(f'{r.max():.1f} GB')}",
+                    f"VRAM  avg {_num(f'{np.mean(v):.1f} GB')}  max {_num(f'{v.max():.1f} GB')}",
+                    f"Swap  max {_num(f'{s.max():.1f} GB')}",
                 ])
             hover_fn = lambda i: (
                 f"RAM {ram_used[i]:.1f} GB    VRAM {gpu_vram[i]:.1f} GB    Swap {swap_used[i]:.1f} GB"
@@ -433,7 +441,7 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
         vl  = pg.PlotCurveItem([], [], pen=cross_pen)
         p.addItem(vl, ignoreBounds=True)
         st  = make_text_item(p, overlay=True)
-        st.setText(default_stats)
+        st.setHtml(default_stats)
         hv  = make_text_item(p, anchor=(0, 1), visible=False, overlay=True)
         reg = make_region(p)
 
@@ -541,14 +549,14 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
         if mask.sum() < 2:
             return
         for ps in panel_states:
-            ps["st"].setText(ps["slice_fn"](mask))
+            ps["st"].setHtml(ps["slice_fn"](mask))
         dur_item.setText(fmt_duration(hi - lo))
         dur_item.setVisible(True)
 
     def on_span_cleared(*_):
         for ps in panel_states:
             ps["reg"].setVisible(False)
-            ps["st"].setText(ps["default_stats"])
+            ps["st"].setHtml(ps["default_stats"])
         dur_item.setVisible(False)
 
     for ps in panel_states:
