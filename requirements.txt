@@ -1,0 +1,5 @@
+numpy>=2.0
+pyqtgraph>=0.13
+
+# Qt binding for pyqtgraph. PyQt6 is used here; PyQt5/PySide2/PySide6 also work.
+PyQt6>=6.0
