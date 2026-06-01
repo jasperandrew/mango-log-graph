@@ -64,13 +64,53 @@ def load_log(path):
     return meta, data, headers
 
 
-def lod_plot(p, x, y, pen, name=None):
-    """Plot a series with native viewport LOD. Options must be set via opts dict
-    after the item is in the scene to avoid a pyqtgraph parent-chain AttributeError."""
-    li = p.plot(x, y, pen=pen, name=name)
+# LOD pyramid: cap on how many source points a curve renders within the viewport,
+# and the decimation step between successive levels. update_lod() picks the finest
+# level whose in-window count stays under the cap, so the rendered detail stays in
+# the (cap/RATIO, cap] band at every zoom — always crisp, never re-scanning the
+# whole series. The cap comfortably exceeds the pixel width, and pyqtgraph's own
+# autoDownsample reduces the rest to viewport resolution.
+LOD_MAX_VISIBLE = 16_000
+LOD_RATIO       = 4
+
+
+def build_pyramid(x, y, cap=LOD_MAX_VISIBLE, ratio=LOD_RATIO):
+    """Build min/max LOD levels for a series, finest (full) first. Each coarser
+    level peak-decimates the full data by a growing factor so spikes survive at
+    every level; the series is cast to float32 to halve memory and GL upload."""
+    y = np.asarray(y, dtype=np.float32)
+    levels = [(x, y)]
+    f = ratio
+    while (len(y) // f) >= 2:
+        n2 = (len(y) // f) * f
+        xs = x[:n2].reshape(-1, f)[:, 0]
+        ys = y[:n2].reshape(-1, f)
+        ox = np.repeat(xs, 2)
+        oy = np.empty(ys.shape[0] * 2, dtype=np.float32)
+        oy[0::2] = ys.min(axis=1)
+        oy[1::2] = ys.max(axis=1)
+        levels.append((ox, oy))
+        if len(oy) <= cap:
+            break
+        f *= ratio
+    return levels
+
+
+def lod_plot(p, x, y, pen, name=None, registry=None):
+    """Plot a series with a tiered LOD pyramid. Shows the coarsest level initially
+    (full zoom-out); update_lod() swaps the active level on zoom. pyqtgraph's
+    clipToView + autoDownsample then slice/reduce the active level per frame.
+
+    Options must be set via the opts dict after the item is in the scene to avoid
+    a pyqtgraph parent-chain AttributeError."""
+    levels = build_pyramid(x, y)
+    idx = len(levels) - 1
+    li = p.plot(*levels[idx], pen=pen, name=name, skipFiniteCheck=True)
     li.opts['clipToView']       = True
     li.opts['autoDownsample']   = True
     li.opts['downsampleMethod'] = 'peak'
+    if registry is not None and len(levels) > 1:
+        registry.append({"item": li, "levels": levels, "idx": idx})
     return li
 
 
@@ -129,9 +169,12 @@ class SpanViewBox(pg.ViewBox):
 
 # ── plot ──────────────────────────────────────────────────────────────────────
 
-def plot(path, smooth=30, stutter_threshold=1.5, show=None):
+def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
     meta, data, headers = load_log(path)
     col = {name: i for i, name in enumerate(headers)}
+
+    if max_fps is not None:
+        data = data[data[:, col["fps"]] < max_fps]
 
     t         = (data[:, col["elapsed"]] - data[0, col["elapsed"]]) / 1e9
     fps       = data[:, col["fps"]]
@@ -218,6 +261,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None):
     # ── build one PlotItem per active panel ──
     panel_states = []
     first_p      = None
+    lod_curves   = []
+    _lp = lambda *a, **k: lod_plot(*a, registry=lod_curves, **k)
 
     for row_i, name in enumerate(active):
         is_last = (row_i == len(active) - 1)
@@ -251,8 +296,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None):
         # ── per-panel data lines, stats, and y-range ──
         if name == "fps":
             p.setLabel("left", "FPS")
-            lod_plot(p, t, fps,     pg.mkPen(C["fps_raw"], width=0.8), "raw")
-            lod_plot(p, t, fps_avg, pg.mkPen(C["fps_avg"], width=1.5), f"{smooth}-frame avg")
+            _lp(p, t, fps,     pg.mkPen(C["fps_raw"], width=0.8), "raw")
+            _lp(p, t, fps_avg, pg.mkPen(C["fps_avg"], width=1.5), f"{smooth}-frame avg")
             p.addLine(y=fps_p1,   pen=pg.mkPen(C["low_line"], width=1, style=dash))
             p.addLine(y=fps_mean, pen=pg.mkPen(C["pct_line"], width=1, style=dash))
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["low_line"], width=1, style=dash)), "1% low")
@@ -273,8 +318,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None):
 
         elif name == "frametime":
             p.setLabel("left", "Frametime (ms)")
-            lod_plot(p, t, ft_ms,   pg.mkPen(C["fps_raw"], width=0.8), "raw")
-            lod_plot(p, t, ft_roll, pg.mkPen(C["ft_avg"],  width=1.5), f"{smooth}-frame avg")
+            _lp(p, t, ft_ms,   pg.mkPen(C["fps_raw"], width=0.8), "raw")
+            _lp(p, t, ft_roll, pg.mkPen(C["ft_avg"],  width=1.5), f"{smooth}-frame avg")
             p.addLine(y=ft_mean, pen=pg.mkPen(C["pct_line"], width=1, style=dash))
             p.addLine(y=ft_p99,  pen=pg.mkPen(C["low_line"], width=1, style=dash))
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["pct_line"], width=1, style=dash)), "avg")
@@ -304,8 +349,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None):
 
         elif name == "load":
             p.setLabel("left", "Load (%)")
-            lod_plot(p, t, cpu_load, pg.mkPen(C["cpu"], width=1), "CPU")
-            lod_plot(p, t, gpu_load, pg.mkPen(C["gpu"], width=1), "GPU")
+            _lp(p, t, cpu_load, pg.mkPen(C["cpu"], width=1), "CPU")
+            _lp(p, t, gpu_load, pg.mkPen(C["gpu"], width=1), "GPU")
             y_default = y_full = (0, 105)
             default_stats = "  ".join([
                 f"CPU  avg {np.mean(cpu_load):.0f}%  max {cpu_load.max():.0f}%",
@@ -321,8 +366,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None):
 
         elif name == "temp":
             p.setLabel("left", "Temp (°C)")
-            lod_plot(p, t, cpu_temp, pg.mkPen(C["cpu"], width=1), "CPU")
-            lod_plot(p, t, gpu_temp, pg.mkPen(C["gpu"], width=1), "GPU")
+            _lp(p, t, cpu_temp, pg.mkPen(C["cpu"], width=1), "CPU")
+            _lp(p, t, gpu_temp, pg.mkPen(C["gpu"], width=1), "GPU")
             tmin = min(float(cpu_temp.min()), float(gpu_temp.min())) * 0.9
             tmax = max(float(cpu_temp.max()), float(gpu_temp.max())) * 1.1
             y_default = y_full = (tmin, tmax)
@@ -341,8 +386,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None):
         elif name == "power":
             p.setLabel("left", "Power (W)")
             if has_cpu_power:
-                lod_plot(p, t, cpu_power, pg.mkPen(C["cpu"], width=1), "CPU")
-            lod_plot(p, t, gpu_power, pg.mkPen(C["gpu"], width=1), "GPU")
+                _lp(p, t, cpu_power, pg.mkPen(C["cpu"], width=1), "CPU")
+            _lp(p, t, gpu_power, pg.mkPen(C["gpu"], width=1), "GPU")
             pmax = max(float(gpu_power.max()),
                        float(cpu_power.max()) if has_cpu_power else 0.0)
             y_default = (0, pmax * 1.2)
@@ -365,9 +410,9 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None):
 
         elif name == "memory":
             p.setLabel("left", "Memory (GB)")
-            lod_plot(p, t, ram_used,  pg.mkPen(C["ram"],  width=1), "RAM")
-            lod_plot(p, t, gpu_vram,  pg.mkPen(C["vram"], width=1), "VRAM")
-            lod_plot(p, t, swap_used, pg.mkPen(C["swap"], width=1), "Swap")
+            _lp(p, t, ram_used,  pg.mkPen(C["ram"],  width=1), "RAM")
+            _lp(p, t, gpu_vram,  pg.mkPen(C["vram"], width=1), "VRAM")
+            _lp(p, t, swap_used, pg.mkPen(C["swap"], width=1), "Swap")
             mem_max = max(float(ram_used.max()), float(gpu_vram.max()), float(swap_used.max()))
             y_default = (0, mem_max * 1.2)
             y_full    = (0, mem_max * 1.05)
@@ -430,29 +475,33 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None):
             idx -= 1
         return idx
 
+    _last_idx = [-1]
+
     def on_mouse_move(scene_pos):
-        found = None
         for ps in panel_states:
             if ps["plot"].sceneBoundingRect().contains(scene_pos):
-                x     = ps["plot"].vb.mapSceneToView(scene_pos).x()
-                found = nearest(x)
-                break
-        if found is not None:
-            xi = float(t[found])
-            for ps in panel_states:
-                vr  = ps["plot"].viewRange()
-                ps["vl"].setData([xi, xi], vr[1])
-                top = vr[1][0] + (vr[1][1] - vr[1][0]) * 0.96
-                ps["hv"].setText(ps["hover_fn"](found))
-                ps["hv"].setPos(xi, top)
-                ps["hv"].setVisible(True)
-        else:
+                x   = ps["plot"].vb.mapSceneToView(scene_pos).x()
+                idx = nearest(x)
+                if idx == _last_idx[0]:
+                    return
+                _last_idx[0] = idx
+                xi  = float(t[idx])
+                for ps2 in panel_states:
+                    vr  = ps2["plot"].viewRange()
+                    ps2["vl"].setData([xi, xi], vr[1])
+                    top = vr[1][0] + (vr[1][1] - vr[1][0]) * 0.96
+                    ps2["hv"].setText(ps2["hover_fn"](idx))
+                    ps2["hv"].setPos(xi, top)
+                    ps2["hv"].setVisible(True)
+                return
+        if _last_idx[0] != -1:
+            _last_idx[0] = -1
             for ps in panel_states:
                 ps["vl"].setData([], [])
                 ps["hv"].setVisible(False)
 
     _keep.append(pg.SignalProxy(
-        first_p.scene().sigMouseMoved, rateLimit=60,
+        first_p.scene().sigMouseMoved, rateLimit=30,
         slot=lambda ev: on_mouse_move(ev[0]),
     ))
 
@@ -488,6 +537,30 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None):
     min_range = avg_dt * 200
     for ps in panel_states:
         ps["vb"].setLimits(xMin=t0, xMax=t_end, minXRange=min_range)
+
+    # ── tiered LOD: pick the finest pyramid level whose in-window point count
+    # stays under the cap, so rendered detail tracks the zoom level. Cheap per
+    # frame (two searchsorts); all curves share the x link and the same level
+    # structure, so one index drives them all and setData fires only on a change. ──
+    n_full = len(t)
+
+    def update_lod():
+        (x0, x1), _ = first_p.vb.viewRange()
+        visible = int(np.searchsorted(t, x1) - np.searchsorted(t, x0))
+        frac    = visible / n_full
+        levels  = lod_curves[0]["levels"]
+        idx     = len(levels) - 1
+        for i, (lx, _ly) in enumerate(levels):
+            if len(lx) * frac <= LOD_MAX_VISIBLE:
+                idx = i
+                break
+        for c in lod_curves:
+            if c["idx"] != idx:
+                c["idx"] = idx
+                c["item"].setData(*c["levels"][idx], skipFiniteCheck=True)
+
+    if lod_curves:
+        first_p.sigXRangeChanged.connect(lambda *_: update_lod())
 
     # ── Y key: toggle constrained ↔ full Y for fps/frametime only ──
     _full_y = False
@@ -541,6 +614,10 @@ if __name__ == "__main__":
                         help="Panels to hide from default set, comma-separated")
     parser.add_argument("-o", "--output",
                         help="Save screenshot to file instead of displaying")
+    parser.add_argument("--max-fps", type=float, default=1000.0, metavar="N",
+                        help="Drop frames at or above N FPS as outliers (default: 1000)")
+    parser.add_argument("--keep-all", action="store_true",
+                        help="Disable outlier filtering; keep all frames regardless of FPS")
     args = parser.parse_args()
 
     if args.show:
@@ -563,14 +640,17 @@ if __name__ == "__main__":
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
+    max_fps = None if args.keep_all else args.max_fps
+
     if args.output:
         win, _ = plot(args.logs[0], smooth=args.smooth, stutter_threshold=args.stutter,
-                      show=show_set)
+                      show=show_set, max_fps=max_fps)
         app.processEvents()
         win.grab().save(args.output)
         print(f"Saved to {args.output}")
         sys.exit(0)
 
-    wins = [plot(p, smooth=args.smooth, stutter_threshold=args.stutter, show=show_set)
+    wins = [plot(p, smooth=args.smooth, stutter_threshold=args.stutter, show=show_set,
+                 max_fps=max_fps)
             for p in args.logs]
     sys.exit(app.exec())
