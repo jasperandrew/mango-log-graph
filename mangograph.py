@@ -169,7 +169,8 @@ class SpanViewBox(pg.ViewBox):
 
 # ── plot ──────────────────────────────────────────────────────────────────────
 
-def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
+def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
+         trim_start=0.0, trim_end=0.0):
     meta, data, headers = load_log(path)
     col = {name: i for i, name in enumerate(headers)}
 
@@ -181,6 +182,17 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
             print(f"Dropped {dropped} of {total} rows "
                   f"({dropped / total * 100:.2f}%) at >= {max_fps:g} FPS")
         data = data[keep]
+
+    if trim_start or trim_end:
+        rel  = (data[:, col["elapsed"]] - data[0, col["elapsed"]]) / 1e9
+        keep = (rel >= trim_start) & (rel <= rel[-1] - trim_end)
+        if keep.sum() < 2:
+            print(f"Trim removes all but {int(keep.sum())} of {len(data)} rows "
+                  f"(session is {fmt_duration(rel[-1])}); skipping trim")
+        else:
+            print(f"Trimmed {len(data) - int(keep.sum())} rows "
+                  f"(-{trim_start:g}s start, -{trim_end:g}s end)")
+            data = data[keep]
 
     t         = (data[:, col["elapsed"]] - data[0, col["elapsed"]]) / 1e9
     fps       = data[:, col["fps"]]
@@ -308,8 +320,8 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0):
             p.addLine(y=fps_mean, pen=pg.mkPen(C["pct_line"], width=1, style=dash))
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["low_line"], width=1, style=dash)), "1% low")
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["pct_line"], width=1, style=dash)), "avg")
-            y_default = (fps_p1 * 0.9, float(np.percentile(fps_avg, 99.99)) * 1.2)
-            y_full    = (float(fps.min()), float(fps.max()) * 1.05)
+            y_default = (0, float(fps_avg.max()) * 1.2)
+            y_full    = (0, float(fps.max()) * 1.05)
             default_stats = "  ".join([
                 f"avg {fps_mean:.0f}", f"1% low {fps_p1:.0f}",
                 f"0.1% low {fps_p01:.0f}", f"max {fps.max():.0f}",
@@ -635,6 +647,10 @@ if __name__ == "__main__":
                         help="Drop frames at or above N FPS as outliers (default: 1000)")
     parser.add_argument("--keep-all", action="store_true",
                         help="Disable outlier filtering; keep all frames regardless of FPS")
+    parser.add_argument("--trim-start", type=float, default=0.0, metavar="SEC",
+                        help="Drop the first SEC seconds of the session")
+    parser.add_argument("--trim-end", type=float, default=0.0, metavar="SEC",
+                        help="Drop the last SEC seconds of the session")
     args = parser.parse_args()
 
     if args.show:
@@ -661,13 +677,14 @@ if __name__ == "__main__":
 
     if args.output:
         win, _ = plot(args.logs[0], smooth=args.smooth, stutter_threshold=args.stutter,
-                      show=show_set, max_fps=max_fps)
+                      show=show_set, max_fps=max_fps,
+                      trim_start=args.trim_start, trim_end=args.trim_end)
         app.processEvents()
         win.grab().save(args.output)
         print(f"Saved to {args.output}")
         sys.exit(0)
 
     wins = [plot(p, smooth=args.smooth, stutter_threshold=args.stutter, show=show_set,
-                 max_fps=max_fps)
+                 max_fps=max_fps, trim_start=args.trim_start, trim_end=args.trim_end)
             for p in args.logs]
     sys.exit(app.exec())
