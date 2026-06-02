@@ -181,8 +181,8 @@ class SpanViewBox(pg.ViewBox):
 
 # ── plot ──────────────────────────────────────────────────────────────────────
 
-def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
-         trim_start=0.0, trim_end=0.0):
+def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
+         trim_start=0.0, trim_end=0.0, hitch_ms=100.0, stall_ms=200.0):
     meta, data, headers = load_log(path)
     col = {name: i for i, name in enumerate(headers)}
 
@@ -354,17 +354,22 @@ def plot(path, smooth=30, stutter_threshold=1.5, show=None, max_fps=1000.0,
             y_full    = (0, float(ft_ms.max()) * Y_PAD_FULL)
             def slice_fn(mask):
                 ft_s = ft_ms[mask]
-                t_s  = t[mask]
-                # reuse precomputed rolling avg rather than re-convolving the slice
-                sc   = int((ft_s > stutter_threshold * ft_roll[mask]).sum())
-                dm   = float(t_s[-1] - t_s[0]) / 60
-                sr   = sc / dm if dm > 0 else 0.0
-                pp99 = float(np.percentile(np.abs(np.diff(ft_s)), 99)) if len(ft_s) > 1 else 0.0
+                n    = len(ft_s)
+                # jitter: small relative unevenness (frame exceeds local rolling
+                # avg by the threshold factor), as a % of frames. reuses the
+                # precomputed rolling avg rather than re-convolving the slice.
+                jit  = (ft_s > jitter_threshold * ft_roll[mask]).sum() / n * 100 if n else 0.0
+                # hitches/stalls: absolute long frames, perception-anchored in ms.
+                hits = int(((ft_s >= hitch_ms) & (ft_s < stall_ms)).sum())
+                st_m = ft_s >= stall_ms
+                stl  = int(st_m.sum())
+                froz = float(ft_s[st_m].sum()) / 1000  # total stall time, ms -> s
                 return "  ".join([
                     f"avg {_num(f'{np.mean(ft_s):.1f} ms')}",
                     f"99th {_num(f'{np.percentile(ft_s, 99):.1f} ms')}",
-                    f"stutters {_num(sc)} ({_num(f'{sr:.1f}/min')})",
-                    f"pacing p99 {_num(f'{pp99:.1f} ms')}",
+                    f"jitter {_num(f'{jit:.1f}%')}",
+                    f"hitches ({hitch_ms:g}ms+) {_num(hits)}",
+                    f"stalls ({stall_ms:g}ms+) {_num(stl)} ({_num(f'{froz:.1f}s')})",
                 ])
             hover_fn = lambda i: f"{ft_ms[i]:.2f} ms  (avg {ft_roll[i]:.2f})"
 
@@ -640,7 +645,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MangoHud plotter (pyqtgraph)")
     parser.add_argument("logs", nargs="*")
     parser.add_argument("--smooth",  type=int,   default=30)
-    parser.add_argument("--stutter", type=float, default=1.5)
+    parser.add_argument("--jitter", type=float, default=1.5,
+                        help="Jitter threshold as a multiple of the rolling average (default: 1.5)")
+    parser.add_argument("--hitch-ms", type=float, default=100.0, metavar="MS",
+                        help="Frametime (ms) at or above which a frame is a hitch (default: 100)")
+    parser.add_argument("--stall-ms", type=float, default=200.0, metavar="MS",
+                        help="Frametime (ms) at or above which a frame is a stall (default: 200)")
     parser.add_argument("--show",    metavar="PANELS",
                         help=f"Panels to display, comma-separated. Options: {','.join(ALL_PANELS)}")
     parser.add_argument("--except",  dest="hide", metavar="PANELS",
@@ -680,15 +690,17 @@ if __name__ == "__main__":
     max_fps = None if args.keep_all else args.max_fps
 
     if args.output:
-        win, _ = plot(args.logs[0], smooth=args.smooth, stutter_threshold=args.stutter,
+        win, _ = plot(args.logs[0], smooth=args.smooth, jitter_threshold=args.jitter,
                       show=show_set, max_fps=max_fps,
-                      trim_start=args.trim_start, trim_end=args.trim_end)
+                      trim_start=args.trim_start, trim_end=args.trim_end,
+                      hitch_ms=args.hitch_ms, stall_ms=args.stall_ms)
         app.processEvents()
         win.grab().save(args.output)
         print(f"Saved to {args.output}")
         sys.exit(0)
 
-    wins = [plot(p, smooth=args.smooth, stutter_threshold=args.stutter, show=show_set,
-                 max_fps=max_fps, trim_start=args.trim_start, trim_end=args.trim_end)
+    wins = [plot(p, smooth=args.smooth, jitter_threshold=args.jitter, show=show_set,
+                 max_fps=max_fps, trim_start=args.trim_start, trim_end=args.trim_end,
+                 hitch_ms=args.hitch_ms, stall_ms=args.stall_ms)
             for p in args.logs]
     sys.exit(app.exec())

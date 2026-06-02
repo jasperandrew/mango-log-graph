@@ -48,7 +48,9 @@ python mangograph.py MyGame_2026-05-29_12-00-00.csv
 | `--show PANELS` | Show only these panels (comma-separated, e.g. `fps,frametime`) |
 | `--except PANELS` | Hide these panels from the default set                    |
 | `--smooth N`    | Rolling-average window size in frames (default: 30)         |
-| `--stutter N`   | Stutter threshold as a multiple of the rolling average (default: 1.5) |
+| `--jitter N`    | Jitter threshold as a multiple of the rolling average (default: 1.5) |
+| `--hitch-ms MS` | Frametime at or above which a frame counts as a hitch (default: 100) |
+| `--stall-ms MS` | Frametime at or above which a frame counts as a stall (default: 200) |
 | `--max-fps N`   | Drop frames at or above N FPS as outliers (default: 1000)   |
 | `--keep-all`    | Disable outlier filtering; keep all frames                  |
 | `--trim-start SEC` | Drop the first SEC seconds of the session                |
