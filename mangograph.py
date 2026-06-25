@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """MangoHud log plotter — pyqtgraph."""
 
+import io
 import sys
+import time
 import argparse
 from pathlib import Path
 
@@ -52,8 +54,15 @@ def fmt_duration(seconds):
 
 
 def rolling_avg(x, window):
+    # Centered moving average. Divide by the count of samples actually overlapping
+    # the window at each position (fewer at the array ends) rather than by `window`,
+    # so the curve isn't dragged toward zero at the edges — which in live mode
+    # would otherwise droop right at the live edge on every frame.
     window = min(window, len(x))
-    return np.convolve(x, np.ones(window) / window, mode="same")
+    kernel = np.ones(window)
+    sums   = np.convolve(x, kernel, mode="same")
+    counts = np.convolve(np.ones(len(x)), kernel, mode="same")
+    return sums / counts
 
 
 def _num(s):
@@ -70,6 +79,54 @@ def load_log(path):
     return meta, data, headers
 
 
+class LogTail:
+    """Incrementally reads rows appended to a MangoHud CSV while it is still
+    being written. Parses the two metadata lines and the header once, then each
+    read_rows() call returns the complete rows appended since the last call
+    (buffering any trailing partial line for next time)."""
+
+    def __init__(self, path):
+        self.f       = open(path)
+        self.meta    = dict(zip(self.f.readline().strip().split(","),
+                                self.f.readline().strip().split(",")))
+        self.headers = self.f.readline().strip().split(",")
+        self._buf    = ""
+
+    def read_rows(self):
+        chunk = self.f.read()
+        if chunk:
+            self._buf += chunk
+        if "\n" not in self._buf:
+            return None
+        body, _, self._buf = self._buf.rpartition("\n")
+        body = body.strip("\n")
+        if not body:
+            return None
+        try:
+            rows = np.loadtxt(io.StringIO(body), delimiter=",")
+        except ValueError:
+            # Likely a torn write; keep the data and retry once more arrives.
+            self._buf = body + "\n" + self._buf
+            return None
+        return rows.reshape(1, -1) if rows.ndim == 1 else rows
+
+
+def _await_initial(tail, timeout=10.0):
+    """Block briefly until the log has at least a couple of rows to plot."""
+    rows = tail.read_rows()
+    waited = 0.0
+    while (rows is None or len(rows) < 2) and waited < timeout:
+        time.sleep(0.2)
+        waited += 0.2
+        more = tail.read_rows()
+        if more is not None:
+            rows = more if rows is None else np.concatenate([rows, more])
+    if rows is None or len(rows) < 2:
+        print("Live: not enough data in the log yet — is MangoHud logging?")
+        sys.exit(1)
+    return rows
+
+
 # LOD pyramid: cap on how many source points a curve renders within the viewport,
 # and the decimation step between successive levels. update_lod() picks the finest
 # level whose in-window count stays under the cap, so the rendered detail stays in
@@ -79,11 +136,20 @@ def load_log(path):
 LOD_MAX_VISIBLE = 16_000
 LOD_RATIO       = 4
 
-# Headroom multipliers for the fps/frametime/power/memory y-axes: the default
-# view leaves more room above a smoothed/typical max, the full view (Y toggle)
-# hugs the absolute max.
-Y_PAD_FIT  = 1.2
+# Y-axis padding. The default ("fit") view frames the data on both ends —
+# fit_range pads the min..max span by FIT_PAD so the lower bound tracks the
+# data, not zero. The full view (Y toggle, fps/frametime only) stays anchored at
+# zero and hugs the absolute max by Y_PAD_FULL.
+FIT_PAD    = 0.1
 Y_PAD_FULL = 1.05
+
+
+def fit_range(lo, hi):
+    """Pad [lo, hi] by a fraction of its span for the fit view, with a small
+    floor so a near-flat series still has visible height. Clamped at zero since
+    these metrics are non-negative."""
+    margin = max((hi - lo) * FIT_PAD, abs(hi) * 0.02, 1e-6)
+    return (max(0.0, lo - margin), hi + margin)
 
 
 def build_pyramid(x, y, cap=LOD_MAX_VISIBLE, ratio=LOD_RATIO):
@@ -182,20 +248,31 @@ class SpanViewBox(pg.ViewBox):
 # ── plot ──────────────────────────────────────────────────────────────────────
 
 def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
-         trim_start=0.0, trim_end=0.0, hitch_ms=100.0, stall_ms=200.0):
-    meta, data, headers = load_log(path)
+         trim_start=0.0, trim_end=0.0, hitch_ms=100.0, stall_ms=200.0,
+         live=False, full_session=False, follow_window=60.0, poll_ms=1000):
+    tail = None
+    if live:
+        tail = LogTail(path)
+        data = _await_initial(tail)
+        meta, headers = tail.meta, tail.headers
+    else:
+        meta, data, headers = load_log(path)
     col = {name: i for i, name in enumerate(headers)}
 
-    if max_fps is not None:
-        total   = len(data)
-        keep    = data[:, col["fps"]] < max_fps
-        dropped = total - int(keep.sum())
-        if dropped:
-            print(f"Dropped {dropped} of {total} rows "
-                  f"({dropped / total * 100:.2f}%) at >= {max_fps:g} FPS")
-        data = data[keep]
+    def filter_fps(rows, announce=False):
+        if max_fps is None:
+            return rows
+        keep    = rows[:, col["fps"]] < max_fps
+        dropped = len(rows) - int(keep.sum())
+        if announce and dropped:
+            print(f"Dropped {dropped} of {len(rows)} rows "
+                  f"({dropped / len(rows) * 100:.2f}%) at >= {max_fps:g} FPS")
+        return rows[keep]
 
-    if trim_start or trim_end:
+    data = filter_fps(data, announce=True)
+
+    # Trimming is a post-hoc operation; it has no meaning for a growing log.
+    if (trim_start or trim_end) and not live:
         rel  = (data[:, col["elapsed"]] - data[0, col["elapsed"]]) / 1e9
         keep = (rel >= trim_start) & (rel <= rel[-1] - trim_end)
         if keep.sum() < 2:
@@ -206,32 +283,44 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
                   f"(-{trim_start:g}s start, -{trim_end:g}s end)")
             data = data[keep]
 
-    t         = (data[:, col["elapsed"]] - data[0, col["elapsed"]]) / 1e9
-    fps       = data[:, col["fps"]]
-    ft_ms     = data[:, col["frametime"]]
-    cpu_load  = data[:, col["cpu_load"]]
-    gpu_load  = data[:, col["gpu_load"]]
-    cpu_temp  = data[:, col["cpu_temp"]]
-    gpu_temp  = data[:, col["gpu_temp"]]
-    gpu_power = data[:, col["gpu_power"]]
-    cpu_power = data[:, col["cpu_power"]]
-    ram_used  = data[:, col["ram_used"]]
-    gpu_vram  = data[:, col["gpu_vram_used"]]
-    swap_used = data[:, col["swap_used"]]
+    # All data-derived arrays/scalars are plot() locals so the per-panel
+    # slice_fn/hover_fn/y closures read them by name; recompute() rebinds them
+    # (via nonlocal) after live rows are appended and every consumer sees the
+    # new data automatically. The elapsed anchor is fixed at the first row.
+    elapsed0 = float(data[0, col["elapsed"]])
+    t = fps = ft_ms = cpu_load = gpu_load = cpu_temp = gpu_temp = None
+    gpu_power = cpu_power = ram_used = gpu_vram = swap_used = None
+    fps_avg = ft_roll = full_mask = None
+    fps_mean = fps_p1 = ft_mean = ft_p99 = t0 = t_end = 0.0
 
-    fps_avg       = rolling_avg(fps, smooth)
-    ft_roll       = rolling_avg(ft_ms, smooth)
+    def recompute():
+        nonlocal t, fps, ft_ms, cpu_load, gpu_load, cpu_temp, gpu_temp
+        nonlocal gpu_power, cpu_power, ram_used, gpu_vram, swap_used
+        nonlocal fps_avg, ft_roll, full_mask
+        nonlocal fps_mean, fps_p1, ft_mean, ft_p99, t0, t_end
+        t         = (data[:, col["elapsed"]] - elapsed0) / 1e9
+        fps       = data[:, col["fps"]]
+        ft_ms     = data[:, col["frametime"]]
+        cpu_load  = data[:, col["cpu_load"]]
+        gpu_load  = data[:, col["gpu_load"]]
+        cpu_temp  = data[:, col["cpu_temp"]]
+        gpu_temp  = data[:, col["gpu_temp"]]
+        gpu_power = data[:, col["gpu_power"]]
+        cpu_power = data[:, col["cpu_power"]]
+        ram_used  = data[:, col["ram_used"]]
+        gpu_vram  = data[:, col["gpu_vram_used"]]
+        swap_used = data[:, col["swap_used"]]
+        fps_avg   = rolling_avg(fps, smooth)
+        ft_roll   = rolling_avg(ft_ms, smooth)
+        fps_mean  = float(np.mean(fps))
+        fps_p1    = float(np.percentile(fps, 1))
+        ft_mean   = float(np.mean(ft_ms))
+        ft_p99    = float(np.percentile(ft_ms, 99))
+        full_mask = np.ones(len(t), dtype=bool)
+        t0, t_end = float(t[0]), float(t[-1])
+
+    recompute()
     has_cpu_power = bool(cpu_power.any())
-
-    # Scalars still needed for the reference lines; per-panel stat strings are
-    # derived from each panel's slice_fn over a full-row mask (see below).
-    fps_mean = float(np.mean(fps))
-    fps_p1   = float(np.percentile(fps, 1))
-    ft_mean  = float(np.mean(ft_ms))
-    ft_p99   = float(np.percentile(ft_ms, 99))
-
-    t0, t_end = float(t[0]), float(t[-1])
-    full_mask = np.ones(len(t), dtype=bool)
 
     if show is None:
         show = set(ALL_PANELS)
@@ -290,7 +379,27 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
     panel_states = []
     first_p      = None
     lod_curves   = []
-    _lp = lambda *a, **k: lod_plot(*a, registry=lod_curves, **k)
+    live_curves  = []   # (curve item, get_y) updated each live tick
+    live_lines   = []   # (reference InfiniteLine, get_value)
+
+    def _lp(p, x, y, pen, name=None, get=None):
+        # Live mode skips the LOD pyramid (rows accrue slowly) and plots a plain
+        # curve that on_tick re-feeds via setData; static mode builds the pyramid.
+        if live:
+            it = p.plot(x, y, pen=pen, name=name, skipFiniteCheck=True)
+            it.opts['clipToView']       = True
+            it.opts['autoDownsample']   = True
+            it.opts['downsampleMethod'] = 'peak'
+            if get is not None:
+                live_curves.append((it, get))
+            return it
+        return lod_plot(p, x, y, pen, name=name, registry=lod_curves)
+
+    def _ref_line(p, get, color):
+        ln = p.addLine(y=get(), pen=pg.mkPen(color, width=1, style=dash))
+        if live:
+            live_lines.append((ln, get))
+        return ln
 
     for row_i, name in enumerate(active):
         is_last = (row_i == len(active) - 1)
@@ -324,14 +433,14 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
         # ── per-panel data lines, stats, and y-range ──
         if name == "fps":
             p.setLabel("left", "FPS")
-            _lp(p, t, fps,     pg.mkPen(C["fps_raw"], width=0.8), "raw")
-            _lp(p, t, fps_avg, pg.mkPen(C["fps_avg"], width=1.5), f"{smooth}-frame avg")
-            p.addLine(y=fps_p1,   pen=pg.mkPen(C["low_line"], width=1, style=dash))
-            p.addLine(y=fps_mean, pen=pg.mkPen(C["pct_line"], width=1, style=dash))
+            _lp(p, t, fps,     pg.mkPen(C["fps_raw"], width=0.8), "raw", get=lambda: fps)
+            _lp(p, t, fps_avg, pg.mkPen(C["fps_avg"], width=1.5), f"{smooth}-frame avg", get=lambda: fps_avg)
+            _ref_line(p, lambda: fps_p1,   C["low_line"])
+            _ref_line(p, lambda: fps_mean, C["pct_line"])
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["pct_line"], width=1, style=dash)), "avg")
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["low_line"], width=1, style=dash)), "1% low")
-            y_default = (0, float(fps_avg.max()) * Y_PAD_FIT)
-            y_full    = (0, float(fps.max()) * Y_PAD_FULL)
+            y_fn  = lambda sl: fit_range(float(fps_avg[sl].min()), float(fps_avg[sl].max()))
+            yf_fn = lambda sl: (0, float(fps[sl].max()) * Y_PAD_FULL)
             def slice_fn(mask):
                 s = fps[mask]
                 return "  ".join([
@@ -344,14 +453,14 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
 
         elif name == "frametime":
             p.setLabel("left", "Frametime (ms)")
-            _lp(p, t, ft_ms,   pg.mkPen(C["fps_raw"], width=0.8), "raw")
-            _lp(p, t, ft_roll, pg.mkPen(C["ft_avg"],  width=1.5), f"{smooth}-frame avg")
-            p.addLine(y=ft_mean, pen=pg.mkPen(C["pct_line"], width=1, style=dash))
-            p.addLine(y=ft_p99,  pen=pg.mkPen(C["low_line"], width=1, style=dash))
+            _lp(p, t, ft_ms,   pg.mkPen(C["fps_raw"], width=0.8), "raw", get=lambda: ft_ms)
+            _lp(p, t, ft_roll, pg.mkPen(C["ft_avg"],  width=1.5), f"{smooth}-frame avg", get=lambda: ft_roll)
+            _ref_line(p, lambda: ft_mean, C["pct_line"])
+            _ref_line(p, lambda: ft_p99,  C["low_line"])
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["pct_line"], width=1, style=dash)), "avg")
             lg.addItem(pg.PlotDataItem(pen=pg.mkPen(C["low_line"], width=1, style=dash)), "99th pct")
-            y_default = (0, float(ft_roll.max()) * Y_PAD_FIT)
-            y_full    = (0, float(ft_ms.max()) * Y_PAD_FULL)
+            y_fn  = lambda sl: fit_range(float(ft_roll[sl].min()), float(ft_roll[sl].max()))
+            yf_fn = lambda sl: (0, float(ft_ms[sl].max()) * Y_PAD_FULL)
             def slice_fn(mask):
                 ft_s = ft_ms[mask]
                 n    = len(ft_s)
@@ -375,9 +484,9 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
 
         elif name == "load":
             p.setLabel("left", "Load (%)")
-            _lp(p, t, cpu_load, pg.mkPen(C["cpu"], width=1), "CPU")
-            _lp(p, t, gpu_load, pg.mkPen(C["gpu"], width=1), "GPU")
-            y_default = y_full = (0, 105)
+            _lp(p, t, cpu_load, pg.mkPen(C["cpu"], width=1), "CPU", get=lambda: cpu_load)
+            _lp(p, t, gpu_load, pg.mkPen(C["gpu"], width=1), "GPU", get=lambda: gpu_load)
+            y_fn = yf_fn = lambda sl: (0, 105)
             def slice_fn(mask):
                 cl, gl = cpu_load[mask], gpu_load[mask]
                 return "  ".join([
@@ -388,11 +497,10 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
 
         elif name == "temp":
             p.setLabel("left", "Temp (°C)")
-            _lp(p, t, cpu_temp, pg.mkPen(C["cpu"], width=1), "CPU")
-            _lp(p, t, gpu_temp, pg.mkPen(C["gpu"], width=1), "GPU")
-            tmin = min(float(cpu_temp.min()), float(gpu_temp.min())) * 0.9
-            tmax = max(float(cpu_temp.max()), float(gpu_temp.max())) * 1.1
-            y_default = y_full = (tmin, tmax)
+            _lp(p, t, cpu_temp, pg.mkPen(C["cpu"], width=1), "CPU", get=lambda: cpu_temp)
+            _lp(p, t, gpu_temp, pg.mkPen(C["gpu"], width=1), "GPU", get=lambda: gpu_temp)
+            y_fn = yf_fn = lambda sl: (min(float(cpu_temp[sl].min()), float(gpu_temp[sl].min())) * 0.9,
+                                       max(float(cpu_temp[sl].max()), float(gpu_temp[sl].max())) * 1.1)
             def slice_fn(mask):
                 ct, gt = cpu_temp[mask], gpu_temp[mask]
                 return "  ".join([
@@ -404,12 +512,14 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
         elif name == "power":
             p.setLabel("left", "Power (W)")
             if has_cpu_power:
-                _lp(p, t, cpu_power, pg.mkPen(C["cpu"], width=1), "CPU")
-            _lp(p, t, gpu_power, pg.mkPen(C["gpu"], width=1), "GPU")
-            pmax = max(float(gpu_power.max()),
-                       float(cpu_power.max()) if has_cpu_power else 0.0)
-            y_default = (0, pmax * Y_PAD_FIT)
-            y_full    = (0, pmax * Y_PAD_FULL)
+                _lp(p, t, cpu_power, pg.mkPen(C["cpu"], width=1), "CPU", get=lambda: cpu_power)
+            _lp(p, t, gpu_power, pg.mkPen(C["gpu"], width=1), "GPU", get=lambda: gpu_power)
+            pmax = lambda sl: max(float(gpu_power[sl].max()),
+                                  float(cpu_power[sl].max()) if has_cpu_power else 0.0)
+            pmin = lambda sl: (min(float(gpu_power[sl].min()), float(cpu_power[sl].min()))
+                               if has_cpu_power else float(gpu_power[sl].min()))
+            y_fn  = lambda sl: fit_range(pmin(sl), pmax(sl))
+            yf_fn = lambda sl: (0, pmax(sl) * Y_PAD_FULL)
             def slice_fn(mask):
                 parts = []
                 if has_cpu_power:
@@ -423,12 +533,13 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
 
         elif name == "memory":
             p.setLabel("left", "Memory (GB)")
-            _lp(p, t, ram_used,  pg.mkPen(C["ram"],  width=1), "RAM")
-            _lp(p, t, gpu_vram,  pg.mkPen(C["vram"], width=1), "VRAM")
-            _lp(p, t, swap_used, pg.mkPen(C["swap"], width=1), "Swap")
-            mem_max = max(float(ram_used.max()), float(gpu_vram.max()), float(swap_used.max()))
-            y_default = (0, mem_max * Y_PAD_FIT)
-            y_full    = (0, mem_max * Y_PAD_FULL)
+            _lp(p, t, ram_used,  pg.mkPen(C["ram"],  width=1), "RAM",  get=lambda: ram_used)
+            _lp(p, t, gpu_vram,  pg.mkPen(C["vram"], width=1), "VRAM", get=lambda: gpu_vram)
+            _lp(p, t, swap_used, pg.mkPen(C["swap"], width=1), "Swap", get=lambda: swap_used)
+            mem_max = lambda sl: max(float(ram_used[sl].max()), float(gpu_vram[sl].max()), float(swap_used[sl].max()))
+            mem_min = lambda sl: min(float(ram_used[sl].min()), float(gpu_vram[sl].min()), float(swap_used[sl].min()))
+            y_fn  = lambda sl: fit_range(mem_min(sl), mem_max(sl))
+            yf_fn = lambda sl: (0, mem_max(sl) * Y_PAD_FULL)
             def slice_fn(mask):
                 r, v, s = ram_used[mask], gpu_vram[mask], swap_used[mask]
                 return "  ".join([
@@ -441,6 +552,7 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
             )
 
         # ── common items attached to this panel ──
+        y_default, y_full = y_fn(slice(None)), yf_fn(slice(None))
         # The default (whole-session) stats are just slice_fn over every row.
         default_stats = slice_fn(full_mask)
         vl  = pg.PlotCurveItem([], [], pen=cross_pen)
@@ -457,6 +569,7 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
             "default_stats": default_stats,
             "slice_fn": slice_fn, "hover_fn": hover_fn,
             "y_default": y_default, "y_full": y_full,
+            "y_fn": y_fn, "yf_fn": yf_fn,
         })
 
     # ── span-duration label centered along the top of the last panel, clear of the
@@ -478,6 +591,7 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
 
     first_p.geometryChanged.connect(lambda: (pin_stats(), pin_dur()))
     _keep = []
+    _span_active = False   # whether a span selection currently drives the stats
 
     # ── crosshair + hover ──
     def nearest(x):
@@ -487,6 +601,7 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
         return idx
 
     _last_idx = -1
+    _mouse_in = True   # cursor inside the widget? (gates stale rate-limited moves)
 
     def place_overlays(idx, set_text=True):
         xi = float(t[idx])
@@ -513,8 +628,18 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
             hv.setPos(round(bx), round(by))
             hv.setVisible(True)
 
+    def clear_crosshair():
+        nonlocal _last_idx
+        if _last_idx != -1:
+            _last_idx = -1
+            for ps in panel_states:
+                ps["vl"].setData([], [])
+                ps["hv"].setVisible(False)
+
     def on_mouse_move(scene_pos):
         nonlocal _last_idx
+        if not _mouse_in:
+            return  # ignore the rate-limited move buffered before the cursor left
         for ps in panel_states:
             if ps["plot"].sceneBoundingRect().contains(scene_pos):
                 idx = nearest(ps["plot"].vb.mapSceneToView(scene_pos).x())
@@ -522,11 +647,24 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
                     _last_idx = idx
                     place_overlays(idx)
                 return
-        if _last_idx != -1:
-            _last_idx = -1
-            for ps in panel_states:
-                ps["vl"].setData([], [])
-                ps["hv"].setVisible(False)
+        clear_crosshair()
+
+    # The mouse-move proxy stops firing once the cursor exits the widget, which
+    # would leave the crosshair frozen at the edge; clear it on leave. A move
+    # event buffered by the proxy may still arrive after the leave, so gate it on
+    # _mouse_in (re-armed on enter) to stop the crosshair flickering back.
+    _prev_leave, _prev_enter = win.leaveEvent, win.enterEvent
+    def _leave(ev):
+        nonlocal _mouse_in
+        _mouse_in = False
+        clear_crosshair()
+        _prev_leave(ev)
+    def _enter(ev):
+        nonlocal _mouse_in
+        _mouse_in = True
+        _prev_enter(ev)
+    win.leaveEvent = _leave
+    win.enterEvent = _enter
 
     # Keep the pixel-space readouts glued to the crosshair as the view moves: a
     # pan/zoom leaves idx unchanged (so on_mouse_move debounces out) but shifts
@@ -549,16 +687,20 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
             ps["reg"].setVisible(True)
 
     def on_span_finished(lo, hi):
+        nonlocal _span_active
         on_span_drag(lo, hi)
         mask = (t >= lo) & (t <= hi)
         if mask.sum() < 2:
             return
+        _span_active = True
         for ps in panel_states:
             ps["st"].setHtml(ps["slice_fn"](mask))
         dur_item.setText(fmt_duration(hi - lo))
         dur_item.setVisible(True)
 
     def on_span_cleared(*_):
+        nonlocal _span_active
+        _span_active = False
         for ps in panel_states:
             ps["reg"].setVisible(False)
             ps["st"].setHtml(ps["default_stats"])
@@ -628,6 +770,8 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
             vis = not legends[0].isVisible()
             for lg in legends:
                 lg.setVisible(vis)
+        elif k == QtCore.Qt.Key.Key_F and live:
+            toggle_follow()
         elif k == QtCore.Qt.Key.Key_Q:
             win.close()
         else:
@@ -637,6 +781,85 @@ def plot(path, smooth=30, jitter_threshold=1.5, show=None, max_fps=1000.0,
     win.show()
     pin_stats()
     pin_dur()
+
+    # ── live mode: poll the growing log and fold new rows into the view ──
+    if live:
+        _following   = True   # auto-track the live edge until the user pans away
+        _prog_xrange = None   # last x-range we set ourselves (to detect user pans)
+
+        def set_xrange_live():
+            nonlocal _prog_xrange
+            lo = t0 if full_session else max(t0, t_end - follow_window)
+            _prog_xrange = (lo, t_end)
+            first_p.setXRange(lo, t_end, padding=0)
+
+        def on_xrange_changed(*_):
+            # A pan/zoom that doesn't match our own set means the user moved the
+            # view; stop chasing the live edge until they re-enable follow (F).
+            nonlocal _following
+            if _following and _prog_xrange is not None:
+                (x0, x1), _ = first_p.vb.viewRange()
+                if abs(x0 - _prog_xrange[0]) > 1e-6 or abs(x1 - _prog_xrange[1]) > 1e-6:
+                    _following = False
+        first_p.sigXRangeChanged.connect(on_xrange_changed)
+
+        def toggle_follow():
+            nonlocal _following
+            _following = not _following
+            if _following:
+                set_xrange_live()
+
+        def fit_y():
+            # Fit each y-axis to the data inside the current x-range (the rolling
+            # window while following), not the whole session, so an old spike
+            # doesn't keep every axis zoomed out.
+            (x0, x1), _ = first_p.vb.viewRange()
+            lo = int(np.searchsorted(t, x0, "left"))
+            hi = int(np.searchsorted(t, x1, "right"))
+            sl = slice(lo, max(hi, lo + 1))
+            for ps in panel_states:
+                ps["y_default"] = ps["y_fn"](sl)
+                ps["y_full"]    = ps["yf_fn"](sl)
+                full = _full_y and ps["name"] in ("fps", "frametime")
+                ps["plot"].setYRange(*(ps["y_full"] if full else ps["y_default"]), padding=0)
+        # Refit y on any view change (follow tick or a manual pan/zoom).
+        first_p.sigXRangeChanged.connect(lambda *_: fit_y())
+
+        def on_tick():
+            nonlocal data
+            rows = tail.read_rows()
+            if rows is None:
+                return
+            rows = filter_fps(rows)
+            if len(rows) == 0:
+                return
+            data = np.concatenate([data, rows], axis=0)
+            recompute()
+            for it, get in live_curves:
+                it.setData(t, get(), skipFiniteCheck=True)
+            for ln, get in live_lines:
+                ln.setValue(get())
+            for ps in panel_states:
+                ps["default_stats"] = ps["slice_fn"](full_mask)
+                if not _span_active:
+                    ps["st"].setHtml(ps["default_stats"])
+            min_range = (t_end - t0) / max(1, len(t) - 1) * 200
+            for ps in panel_states:
+                ps["vb"].setLimits(xMin=t0, xMax=t_end, minXRange=min_range)
+            bottom = last_p.getAxis("bottom")
+            bottom._show_hours = t_end >= 3600
+            last_p.setLabel("bottom", f"[{fmt_duration(t_end)}]")
+            if _following:
+                set_xrange_live()  # shifts the window → sigXRangeChanged → fit_y
+            else:
+                fit_y()            # window unchanged but its contents may have
+
+        timer = QtCore.QTimer()
+        timer.timeout.connect(on_tick)
+        timer.start(poll_ms)
+        _keep.append(timer)
+        set_xrange_live()
+        fit_y()
 
     return win, tuple(_keep)
 
@@ -665,6 +888,14 @@ if __name__ == "__main__":
                         help="Drop the first SEC seconds of the session")
     parser.add_argument("--trim-end", type=float, default=0.0, metavar="SEC",
                         help="Drop the last SEC seconds of the session")
+    parser.add_argument("--live", action="store_true",
+                        help="Update the plot as the log file is written")
+    parser.add_argument("--full-session", action="store_true",
+                        help="Live: show the whole growing session instead of a rolling window")
+    parser.add_argument("--window", type=float, default=60.0, metavar="SEC",
+                        help="Live: rolling window length in seconds (default: 60)")
+    parser.add_argument("--poll", type=int, default=1000, metavar="MS",
+                        help="Live: log poll interval in milliseconds (default: 1000)")
     args = parser.parse_args()
 
     if args.show:
@@ -701,6 +932,8 @@ if __name__ == "__main__":
 
     wins = [plot(p, smooth=args.smooth, jitter_threshold=args.jitter, show=show_set,
                  max_fps=max_fps, trim_start=args.trim_start, trim_end=args.trim_end,
-                 hitch_ms=args.hitch_ms, stall_ms=args.stall_ms)
+                 hitch_ms=args.hitch_ms, stall_ms=args.stall_ms,
+                 live=args.live, full_session=args.full_session,
+                 follow_window=args.window, poll_ms=args.poll)
             for p in args.logs]
     sys.exit(app.exec())

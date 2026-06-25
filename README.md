@@ -28,6 +28,22 @@ Or pass one or more log files explicitly (each opens in its own window):
 python mangograph.py MyGame_2026-05-29_12-00-00.csv
 ```
 
+### Live mode
+
+With `--live`, the plot updates as MangoHud writes the log, so you can watch a
+session in real time. By default it follows a rolling window of the last 60
+seconds (`--window`); pan or zoom to inspect history and the view detaches from
+the live edge — press `F` to re-attach. Use `--full-session` to keep the whole
+growing session in view instead. Y axes grow to fit new spikes automatically.
+
+```
+python mangograph.py --live              # follow the newest log as it's written
+python mangograph.py --live --window 30  # 30-second rolling window
+```
+
+(Requires a MangoHud build that flushes rows to the CSV during the session
+rather than only on stop.)
+
 ### Interactions
 
 | Action        | Effect                                                |
@@ -39,6 +55,7 @@ python mangograph.py MyGame_2026-05-29_12-00-00.csv
 | Hover         | Crosshair with per-panel values at the cursor         |
 | `Y`           | Toggle the fps/frametime Y axis between fit and full  |
 | `L`           | Toggle legend visibility                              |
+| `F`           | (live mode) Toggle following the live edge            |
 | `Q`           | Close the window                                      |
 
 ### Options
@@ -55,6 +72,10 @@ python mangograph.py MyGame_2026-05-29_12-00-00.csv
 | `--keep-all`    | Disable outlier filtering; keep all frames                  |
 | `--trim-start SEC` | Drop the first SEC seconds of the session                |
 | `--trim-end SEC`   | Drop the last SEC seconds of the session                 |
+| `--live`        | Update the plot as the log file is written                  |
+| `--window SEC`  | Live: rolling window length (default: 60)                   |
+| `--full-session` | Live: show the whole growing session instead of a window   |
+| `--poll MS`     | Live: log poll interval in milliseconds (default: 1000)     |
 | `-o FILE`       | Save a screenshot to FILE instead of opening a window       |
 
 ### Panel Names
